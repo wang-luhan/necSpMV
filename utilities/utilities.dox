@@ -1,0 +1,4 @@
+/**
+    * @defgroup utilities
+    * @brief Some utilities for test/perf testing.
+    */

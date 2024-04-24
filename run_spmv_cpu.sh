@@ -1,0 +1,10 @@
+cd data
+make convert
+cd ..
+mkdir build
+cd build
+cmake ..
+make -j
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+./bin/PerfSparse_test_cpu --gtest_filter=mxv_test_VNEC*.*
