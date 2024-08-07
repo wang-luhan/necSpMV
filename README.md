@@ -1,5 +1,5 @@
-# PerfSparse
-An Optimized Sparse BLAS library on CPUs and GPUs
+# necSpMV
+An Optimized SpMV kernel on CPUs and GPUs
 ## Computing Environment
 ### Hardware
 Intel(R) Xeon(R) Gold 6240 CPU @ 2.60GHz,
