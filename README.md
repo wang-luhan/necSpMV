@@ -37,8 +37,11 @@ Note that, for some network reasons, some sparse matrix data cannot be downloade
 make convert
 ```
 
-## Run test demos in fp32
+## Run test demos on GPUs
 
 ```bash
-cd build
-./bin/PerfSparse_test_cuda --gtest_filter=cuda_test_spmv_FP32.roadN*
+cd scripts
+# run GPU test cases.
+bash alltest.sh
+#convert performance_report.log to *.xlsx
+bash run_py.sh
