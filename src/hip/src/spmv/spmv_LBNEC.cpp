@@ -1,0 +1,462 @@
+#include "hip/hip_runtime.h"
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
+#include "spmv_hip.h"
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <algorithm>  // 包含 std::sort
+#include <functional> // 包含 std::greater
+
+#include "hip_timer.h"
+
+#define test_iter 2000
+template <int BREAK_STRIDE, typename I>
+__global__ void pre_startRowPerBlock(const I *__restrict__ row_ptr,
+                                     const I m,
+                                     I *__restrict__ startRowPerBlock)
+{
+  const int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (global_thread_id > m + 1)
+    return;
+  int a = row_ptr[global_thread_id];
+  int b = row_ptr[min(global_thread_id + 1, (int)m + 1)];
+
+  int blocka = divup<int>(a, BREAK_STRIDE);
+  int blockb = (b - 1) / static_cast<int>(BREAK_STRIDE);
+
+  if (a != b)
+    for (; blocka <= blockb; ++blocka)
+      startRowPerBlock[blocka] = global_thread_id;
+}
+
+template <typename I, typename T, perfSpB_index NNZ_PER_BLOCK, perfSpB_index THREADS_PER_BLOCK>
+__device__ __forceinline__ void lbNEC_reduce_oneRow_in_thread(const int tid_in_block, const int block_id,
+                                                              const I reduceStartRowId, const I reduceEndRowId,
+                                                              const I *__restrict__ row_ptr,
+                                                              const T *__restrict__ smem, T *__restrict__ y)
+{
+  I reduce_row_id = reduceStartRowId + tid_in_block;
+  I nnz_id_before = block_id * NNZ_PER_BLOCK;
+  for (; reduce_row_id < reduceEndRowId; reduce_row_id += THREADS_PER_BLOCK)
+  {
+    T sum = 0;
+    // const I reduce_start_idx = max((perfSpB_index)0, row_ptr[reduce_row_id] - nnz_id_before);
+    // const I reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - nnz_id_before);
+    const I reduce_start_idx = (row_ptr[reduce_row_id] - nnz_id_before) < 0 ? 0 : (row_ptr[reduce_row_id] - nnz_id_before);
+    const I reduce_end_idx = (row_ptr[reduce_row_id + 1] - nnz_id_before) > NNZ_PER_BLOCK ? NNZ_PER_BLOCK : (row_ptr[reduce_row_id + 1] - nnz_id_before);
+    for (int i = reduce_start_idx; i < reduce_end_idx; i++)
+    {
+      sum += smem[i];
+    }
+    atomicAdd(y + reduce_row_id, sum);
+  }
+}
+
+template <typename I, typename T, perfSpB_index NNZ_PER_BLOCK, perfSpB_index THREADS_PER_BLOCK>
+__device__ __forceinline__ void lbNEC_reduce_oneRow_in_block(const int tid_in_block, const int block_id,
+                                                             const I reduceStartRowId, const I reduceEndRowId,
+                                                             const I *__restrict__ row_ptr,
+                                                             const T *__restrict__ smem, T *__restrict__ y)
+{
+  __shared__ volatile T LDS[THREADS_PER_BLOCK];
+
+  T sum = 0;
+  const I reduce_start_idx = max((perfSpB_index)0, row_ptr[reduceStartRowId] - block_id * NNZ_PER_BLOCK);
+  const I reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduceStartRowId + 1] - block_id * NNZ_PER_BLOCK);
+
+  for (int j = reduce_start_idx + threadIdx.x; j < reduce_end_idx; j += blockDim.x)
+  {
+    sum += smem[j];
+  }
+  LDS[threadIdx.x] = sum;
+  __syncthreads();
+
+  // Reduce partial sums
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
+  {
+    __syncthreads();
+    if (threadIdx.x < stride)
+      LDS[threadIdx.x] += LDS[threadIdx.x + stride];
+  }
+  // Write result
+  if (threadIdx.x == 0)
+    atomicAdd(y + reduceStartRowId, LDS[threadIdx.x]);
+}
+
+// template <int VEC_SIZE>
+// __device__ __forceinline__ float warpReduceSum(float sum)
+// {
+//   if (VEC_SIZE >= 64)
+//     sum += __shfl_down_sync(0xffffffffffffffff, sum, 32); // 0-32, 1-33, 2-34, etc.
+//   if (VEC_SIZE >= 32)
+//     sum += __shfl_down_sync(0xffffffffffffffff, sum, 16); // 0-16, 1-17, 2-18, etc.
+//   if (VEC_SIZE >= 16)
+//     sum += __shfl_down_sync(0xffffffffffffffff, sum, 8);  // 0-8, 1-9, 2-10, etc.
+//   if (VEC_SIZE >= 8)
+//     sum += __shfl_down_sync(0xffffffffffffffff, sum, 4);  // 0-4, 1-5, 2-6, etc.
+//   if (VEC_SIZE >= 4)
+//     sum += __shfl_down_sync(0xffffffffffffffff, sum, 2);  // 0-2, 1-3, 4-6, 5-7, etc.
+//   if (VEC_SIZE >= 2)
+//     sum += __shfl_down_sync(0xffffffffffffffff, sum, 1);  // 0-1, 2-3, 4-5, etc.
+//   return sum;
+// }
+
+template <int VEC_SIZE>
+__device__ __forceinline__ float warpReduceSum(float sum)
+{
+  if (VEC_SIZE >= 64)
+    sum += __shfl_down(sum, 32); // 0-32, 1-33, 2-34, etc.
+  if (VEC_SIZE >= 32)
+    sum += __shfl_down(sum, 16); // 0-16, 1-17, 2-18, etc.
+  if (VEC_SIZE >= 16)
+    sum += __shfl_down(sum, 8);  // 0-8, 1-9, 2-10, etc.
+  if (VEC_SIZE >= 8)
+    sum += __shfl_down(sum, 4);  // 0-4, 1-5, 2-6, etc.
+  if (VEC_SIZE >= 4)
+    sum += __shfl_down(sum, 2);  // 0-2, 1-3, 4-6, 5-7, etc.
+  if (VEC_SIZE >= 2)
+    sum += __shfl_down(sum, 1);  // 0-1, 2-3, 4-5, etc.
+  return sum;
+}
+
+
+
+template <typename I, typename T, int NNZ_PER_BLOCK, int THREADS_PER_BLOCK, int VECTOR_SIZE>
+__device__ __forceinline__ void
+lbNEC_reduce_oneRow_in_vector(const int n_reduce_rows_num, const int tid_in_block, const int block_id,
+                              const I reduceStartRowId, const I reduceEndRowId,
+                              const I *__restrict__ row_ptr, const T *__restrict__ smem, T *__restrict__ y)
+{
+  // use `vec_num` vectors, each vector can process reduction of one row by involving `vec_size` threads.
+  const I vec_size = VECTOR_SIZE;
+  const I vec_num = THREADS_PER_BLOCK / vec_size;
+  const I vec_id = tid_in_block / vec_size;
+  const I tid_in_vec = tid_in_block & (vec_size - 1);
+
+  I reduce_row_id = reduceStartRowId + vec_id;
+  for (; reduce_row_id < reduceEndRowId; reduce_row_id += vec_num)
+  {
+    const I reduce_start_idx = max((perfSpB_index)0, row_ptr[reduce_row_id] - block_id * NNZ_PER_BLOCK);
+    const I reduce_end_idx = min((perfSpB_index)NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - block_id * NNZ_PER_BLOCK);
+    // reduce LDS via vectors.
+    T sum = 0;
+    for (int i = reduce_start_idx + tid_in_vec; i < reduce_end_idx; i += vec_size)
+    {
+      sum += smem[i];
+    }
+    sum = warpReduceSum<vec_size>(sum);
+    // store value
+    if (tid_in_vec == 0)
+    {
+      atomicAdd(y + reduce_row_id, sum);
+    }
+  }
+}
+
+template <typename I, typename T, int NNZ_PER_BLOCK, int THREADS_PER_BLOCK, int VECTOR_SIZE>
+__device__ __forceinline__ void
+lbNEC_reduce_oneRow_in_vector_L(const int n_reduce_rows_num, const int tid_in_block, const int block_id,
+                                const I reduceStartRowId, const I reduceEndRowId,
+                                const I *__restrict__ row_ptr, const T *__restrict__ smem, T *__restrict__ y)
+{
+  // use `vec_num` vectors, each vector can process reduction of one row by involving `vec_size` threads.
+  const I vec_size = VECTOR_SIZE;
+  const I vec_num = THREADS_PER_BLOCK / vec_size;
+  const I vec_id = tid_in_block / vec_size;
+  const I tid_in_vec = tid_in_block & (vec_size - 1);
+  const I warp_lane_id = tid_in_block & 31;
+
+  I reduce_row_id = reduceStartRowId + vec_id;
+  for (; reduce_row_id < reduceEndRowId; reduce_row_id += vec_num)
+  {
+    const I reduce_start_idx = max((perfSpB_index)0, row_ptr[reduce_row_id] - block_id * NNZ_PER_BLOCK);
+    const I reduce_end_idx = min((perfSpB_index)NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - block_id * NNZ_PER_BLOCK);
+    // reduce LDS via vectors.
+    T sum = 0;
+    for (int i = reduce_start_idx + tid_in_vec; i < reduce_end_idx; i += vec_size)
+    {
+      sum += smem[i];
+    }
+    // sum = warpReduceSum<vec_size>(sum);
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+      // sum += __shfl_down_sync(0xffffffff, sum, offset);
+      sum += __shfl_down(sum, offset);
+    }
+    // store value
+    if (warp_lane_id == 0)
+    {
+      atomicAdd(y + reduce_row_id, sum);
+    }
+  }
+}
+
+template <perfSpB_index productNnzPerThread, perfSpB_index THREADS_PER_BLOCK, typename I, typename T>
+__global__ void spmv_lbNEC_kernel(T *d_val,
+                                  perfSpB_index *d_ptr,
+                                  perfSpB_index *d_cols,
+                                  perfSpB_index nrows,
+                                  T *d_vector,
+                                  T *d_out,
+                                  I *__restrict__ startRowPerBlock)
+{
+  const int tid_in_block = threadIdx.x;
+  const int NNZ_PER_BLOCK = THREADS_PER_BLOCK * productNnzPerThread;
+  __shared__ T middle_s[NNZ_PER_BLOCK];
+  const I lastElemId = d_ptr[nrows];
+
+  int blockNnzStart = NNZ_PER_BLOCK * blockIdx.x;
+
+  // product and stream in Shared Memory
+#pragma unroll
+  for (int round = 0; round < productNnzPerThread; round++)
+  {
+    const I sIdx = tid_in_block + round * THREADS_PER_BLOCK;
+    const I gIdx = min(blockNnzStart + sIdx, lastElemId - 1);
+    middle_s[sIdx] = d_val[gIdx] * d_vector[d_cols[gIdx]];
+  }
+  __syncthreads();
+
+  const I reduceStartRowId = min(startRowPerBlock[blockIdx.x], nrows);
+  I reduceEndRowId = min(startRowPerBlock[blockIdx.x + 1], nrows);
+  reduceEndRowId = (reduceEndRowId == 0) ? nrows : reduceEndRowId;
+  if (d_ptr[reduceEndRowId] % NNZ_PER_BLOCK != 0 || reduceEndRowId == reduceStartRowId)
+  {
+    reduceEndRowId = min(reduceEndRowId + 1, nrows);
+  }
+  // online workload balance reduction
+  const I n_reduce_rows_num = reduceEndRowId - reduceStartRowId;
+
+  // when threads = 128
+  if (n_reduce_rows_num > 64)
+  {
+    lbNEC_reduce_oneRow_in_thread<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK>(tid_in_block, blockIdx.x,
+                                                                          reduceStartRowId, reduceEndRowId,
+                                                                          d_ptr, middle_s, d_out);
+  }
+  else if (n_reduce_rows_num == 1)
+  {
+    lbNEC_reduce_oneRow_in_block<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK>(tid_in_block, blockIdx.x,
+                                                                         reduceStartRowId, reduceEndRowId,
+                                                                         d_ptr, middle_s, d_out);
+  }
+  else if (n_reduce_rows_num == 2)
+  {
+    lbNEC_reduce_oneRow_in_vector<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK, 64>(n_reduce_rows_num, tid_in_block, blockIdx.x,
+                                                                                reduceStartRowId, reduceEndRowId,
+                                                                                d_ptr, middle_s, d_out);
+  }
+  else if (n_reduce_rows_num <= 4)
+  {
+    lbNEC_reduce_oneRow_in_vector<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK, 32>(n_reduce_rows_num, tid_in_block, blockIdx.x,
+                                                                              reduceStartRowId, reduceEndRowId,
+                                                                              d_ptr, middle_s, d_out);
+  }
+  else if (n_reduce_rows_num <= 8)
+  {
+    lbNEC_reduce_oneRow_in_vector<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK, 16>(n_reduce_rows_num, tid_in_block, blockIdx.x,
+                                                                              reduceStartRowId, reduceEndRowId,
+                                                                              d_ptr, middle_s, d_out);
+  }
+  else if (n_reduce_rows_num <= 16)
+  {
+    lbNEC_reduce_oneRow_in_vector<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK, 8>(n_reduce_rows_num, tid_in_block, blockIdx.x,
+                                                                             reduceStartRowId, reduceEndRowId,
+                                                                             d_ptr, middle_s, d_out);
+  }
+  else if (n_reduce_rows_num <= 32)
+  {
+    lbNEC_reduce_oneRow_in_vector<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK, 4>(n_reduce_rows_num, tid_in_block, blockIdx.x,
+                                                                             reduceStartRowId, reduceEndRowId,
+                                                                             d_ptr, middle_s, d_out);
+  }
+  else if (n_reduce_rows_num <= 64)
+  {
+    lbNEC_reduce_oneRow_in_vector<I, T, NNZ_PER_BLOCK, THREADS_PER_BLOCK, 2>(n_reduce_rows_num, tid_in_block, blockIdx.x,
+                                                                             reduceStartRowId, reduceEndRowId,
+                                                                             d_ptr, middle_s, d_out);
+  }
+}
+
+perfSpB_info perfSpB_SpMV_LBNEC_FP32(perfSpB_operation_t op,
+                                     const void *alpha,
+                                     const perfSpB_matrix matA,
+                                     const perfSpB_vector vecX,
+                                     const void *beta,
+                                     perfSpB_vector vecY)
+{
+  UNUSED(op);
+  UNUSED(alpha);
+  UNUSED(beta);
+  perfSpB_vector_Dense *vecY_csr = (perfSpB_vector_Dense *)(vecY);
+  perfSpB_vector_Dense *vecX_csr = (perfSpB_vector_Dense *)(vecX);
+  perfSpB_matrix_CSC_or_CSR *matA_csr = (perfSpB_matrix_CSC_or_CSR *)(matA);
+  perfSpB_index nrows = matA->row;
+  // perfSpB_index ncols = matA->col;
+  perfSpB_index nvals = matA_csr->nnz;
+
+  float *d_vecY_csr, *d_vecX_csr, *d_val;
+  perfSpB_index *d_indices, *d_ptr;
+  for (int i = 0; i < matA->row; i++)
+  {
+    if (*((float *)vecY_csr->values) != 0)
+    {
+      printf("\n %f \n", *((float *)vecY_csr->values));
+    }
+  }
+
+  hipMalloc(&d_vecY_csr, sizeof(float) * vecY->n);
+  hipMalloc(&d_vecX_csr, sizeof(float) * vecX->n);
+  hipMalloc(&d_val, sizeof(float) * matA_csr->nnz);
+  hipMalloc(&d_indices, sizeof(perfSpB_index) * matA_csr->nnz);
+  hipMalloc(&d_ptr, sizeof(perfSpB_index) * (vecY->n + 1));
+
+  hipMemcpy(d_val, matA_csr->val, sizeof(float) * matA_csr->nnz, hipMemcpyHostToDevice);
+  hipMemcpy(d_indices, matA_csr->indices, sizeof(perfSpB_index) * matA_csr->nnz, hipMemcpyHostToDevice);
+  hipMemcpy(d_ptr, matA_csr->ptr, sizeof(perfSpB_index) * (vecY->n + 1), hipMemcpyHostToDevice);
+  hipMemcpy(d_vecX_csr, ((float *)vecX_csr->values), sizeof(float) * vecX->n, hipMemcpyHostToDevice);
+  hipMemcpy(d_vecY_csr, ((float *)vecY_csr->values), sizeof(float) * vecY->n, hipMemcpyHostToDevice);
+
+  const int productNnzPerThread = 4;
+  const int THREADS_PER_BLOCK = 128;
+
+  const int WORK_BLOCKS = nvals / (productNnzPerThread * THREADS_PER_BLOCK) + ((nvals % (productNnzPerThread * THREADS_PER_BLOCK) == 0) ? 0 : 1);
+
+  const perfSpB_index startRowPerBlock_len = WORK_BLOCKS + 1;
+
+  perfSpB_index *startRowPerBlock;
+  hipMalloc((void **)&startRowPerBlock, sizeof(perfSpB_index) * startRowPerBlock_len);
+  hipMemset(startRowPerBlock, 0, sizeof(perfSpB_index) * startRowPerBlock_len);
+  // hipLaunchKernelGGL((pre_startRowPerBlock<productNnzPerThread * THREADS_PER_BLOCK, perfSpB_index>), dim3(divup<uint32_t>(nrows + 1, 256)), dim3(256), 0, 0, d_ptr, nrows, startRowPerBlock);
+  (pre_startRowPerBlock<productNnzPerThread * THREADS_PER_BLOCK, perfSpB_index>)<<<divup<uint32_t>(nrows + 1, 256), 256>>>(d_ptr, nrows, startRowPerBlock);
+
+  hip_time_test_start();
+  for (int i = 0; i < test_iter; i++)
+  {
+    // hipMemset(d_vecY_csr, 0.0, sizeof(float) * vecY->n);
+    // hipLaunchKernelGGL((spmv_lbNEC_kernel<productNnzPerThread, THREADS_PER_BLOCK, perfSpB_index, float>), dim3((WORK_BLOCKS)), dim3((THREADS_PER_BLOCK)), 0, 0, d_val, d_ptr, d_indices, nrows, d_vecX_csr, d_vecY_csr, startRowPerBlock);
+    (spmv_lbNEC_kernel<productNnzPerThread, THREADS_PER_BLOCK, perfSpB_index, float>)<<<(WORK_BLOCKS), (THREADS_PER_BLOCK)>>>(d_val, d_ptr, d_indices, nrows, d_vecX_csr, d_vecY_csr, startRowPerBlock);
+  }
+  hip_time_test_end();
+
+  double runtime = (elapsedTime) / test_iter;
+  double gflops = (2.0 * matA_csr->nnz) / ((runtime / 1000) * 1e9);
+
+  hipDeviceSynchronize();
+  printf("\n SpMV CUDA kernel runtime = %g ms\n", runtime);
+  // printf("\n SpMV CUDA kernel2 runtime = %g ms\n", runtime2);
+  printf("\n SpMV Performance  = %lf GFLOPS\n", gflops);
+
+  hipMemcpy(((float *)vecY_csr->values), d_vecY_csr, sizeof(float) * vecY->n, hipMemcpyDeviceToHost);
+
+  hipError_t cudaStatus = hipGetLastError();
+  if (cudaStatus != hipSuccess)
+  {
+    printf("Error:%s\n", hipGetErrorString(cudaStatus));
+    exit(EXIT_FAILURE);
+  }
+
+  // hipFree(d_vecY_csr);
+  // hipFree(d_vecX_csr);
+  // hipFree(d_val);
+  // hipFree(d_indices);
+  // hipFree(d_ptr);
+  // hipFree(startRowPerBlock);
+
+  return perfSpB_success;
+}
+
+perfSpB_info perfSpB_SpMV_LBNEC_FP64(perfSpB_operation_t op,
+                                     const void *alpha,
+                                     const perfSpB_matrix matA,
+                                     const perfSpB_vector vecX,
+                                     const void *beta,
+                                     perfSpB_vector vecY)
+{
+  UNUSED(op);
+  UNUSED(alpha);
+  UNUSED(beta);
+  perfSpB_vector_Dense *vecY_csr = (perfSpB_vector_Dense *)(vecY);
+  perfSpB_vector_Dense *vecX_csr = (perfSpB_vector_Dense *)(vecX);
+  perfSpB_matrix_CSC_or_CSR *matA_csr = (perfSpB_matrix_CSC_or_CSR *)(matA);
+  perfSpB_index nrows = matA->row;
+  // perfSpB_index ncols = matA->col;
+  perfSpB_index nvals = matA_csr->nnz;
+
+  double *d_vecY_csr, *d_vecX_csr, *d_val;
+  perfSpB_index *d_indices, *d_ptr;
+  for (int i = 0; i < matA->row; i++)
+  {
+    if (*((double *)vecY_csr->values) != 0)
+    {
+      printf("\n %f \n", *((double *)vecY_csr->values));
+    }
+  }
+
+  hipMalloc(&d_vecY_csr, sizeof(double) * vecY->n);
+  hipMalloc(&d_vecX_csr, sizeof(double) * vecX->n);
+  hipMalloc(&d_val, sizeof(double) * matA_csr->nnz);
+  hipMalloc(&d_indices, sizeof(perfSpB_index) * matA_csr->nnz);
+  hipMalloc(&d_ptr, sizeof(perfSpB_index) * (vecY->n + 1));
+
+  hipMemcpy(d_val, matA_csr->val, sizeof(double) * matA_csr->nnz, hipMemcpyHostToDevice);
+  hipMemcpy(d_indices, matA_csr->indices, sizeof(perfSpB_index) * matA_csr->nnz, hipMemcpyHostToDevice);
+  hipMemcpy(d_ptr, matA_csr->ptr, sizeof(perfSpB_index) * (vecY->n + 1), hipMemcpyHostToDevice);
+  hipMemcpy(d_vecX_csr, ((double *)vecX_csr->values), sizeof(double) * vecX->n, hipMemcpyHostToDevice);
+  hipMemcpy(d_vecY_csr, ((double *)vecY_csr->values), sizeof(double) * vecY->n, hipMemcpyHostToDevice);
+
+  const int productNnzPerThread = 4;
+  const int THREADS_PER_BLOCK = 128;
+
+  const int WORK_BLOCKS = nvals / (productNnzPerThread * THREADS_PER_BLOCK) + ((nvals % (productNnzPerThread * THREADS_PER_BLOCK) == 0) ? 0 : 1);
+
+  const perfSpB_index startRowPerBlock_len = WORK_BLOCKS + 1;
+
+  perfSpB_index *startRowPerBlock;
+  hipMalloc((void **)&startRowPerBlock, sizeof(perfSpB_index) * startRowPerBlock_len);
+  hipMemset(startRowPerBlock, 0, sizeof(perfSpB_index) * startRowPerBlock_len);
+
+  // hipLaunchKernelGGL((pre_startRowPerBlock<productNnzPerThread * THREADS_PER_BLOCK, perfSpB_index>), dim3(divup<uint32_t>(nrows + 1, 256)), dim3(256), 0, 0, d_ptr, nrows, startRowPerBlock);
+  (pre_startRowPerBlock<productNnzPerThread * THREADS_PER_BLOCK, perfSpB_index>)<<<divup<uint32_t>(nrows + 1, 256), 256>>>(d_ptr, nrows, startRowPerBlock);
+  
+  hip_time_test_start();
+  for (int i = 0; i < test_iter; i++)
+  {
+    // hipMemset(d_vecY_csr, 0.0, sizeof(double) * vecY->n);
+    // hipLaunchKernelGGL((spmv_lbNEC_kernel<productNnzPerThread, THREADS_PER_BLOCK, perfSpB_index, double>), dim3((WORK_BLOCKS)), dim3((THREADS_PER_BLOCK)), 0, 0, d_val, d_ptr, d_indices, nrows, d_vecX_csr, d_vecY_csr, startRowPerBlock);
+    (spmv_lbNEC_kernel<productNnzPerThread, THREADS_PER_BLOCK, perfSpB_index, double>)<<<(WORK_BLOCKS), (THREADS_PER_BLOCK)>>>(d_val, d_ptr, d_indices, nrows, d_vecX_csr, d_vecY_csr, startRowPerBlock);
+  }
+  
+  hip_time_test_end();
+  double runtime = (elapsedTime) / test_iter;
+  double gflops = (2.0 * matA_csr->nnz) / ((runtime / 1000) * 1e9);
+
+  hipDeviceSynchronize();
+  printf("\n SpMV CUDA kernel runtime = %g ms\n", runtime);
+  // printf("\n SpMV CUDA kernel2 runtime = %g ms\n", runtime2);
+  printf("\n SpMV Performance  = %lf GFLOPS\n", gflops);
+
+  hipMemcpy(((double *)vecY_csr->values), d_vecY_csr, sizeof(double) * vecY->n, hipMemcpyDeviceToHost);
+
+  hipError_t cudaStatus = hipGetLastError();
+  if (cudaStatus != hipSuccess)
+  {
+    printf("Error:%s\n", hipGetErrorString(cudaStatus));
+    exit(EXIT_FAILURE);
+  }
+
+  // hipFree(d_vecY_csr);
+  // hipFree(d_vecX_csr);
+  // hipFree(d_val);
+  // hipFree(d_indices);
+  // hipFree(d_ptr);
+  // hipFree(startRowPerBlock);
+
+  return perfSpB_success;
+}
+
+
+
+
